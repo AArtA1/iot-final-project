@@ -7,6 +7,3 @@ venv/
 # Docker / local
 *.log
 .DS_Store
-
-# Claude Code (local, machine-specific)
-.claude/settings.local.json
