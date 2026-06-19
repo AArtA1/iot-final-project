@@ -125,27 +125,3 @@ flink-iot-final-project/
     ├── ddl.sql                 # CREATE TABLE device_types
     └── dml.sql                 # наполнение справочника
 ```
-
-## Заметки и тюнинг
-
-- **Часовой пояс.** Генератор пишет `event_time` в UTC, окна тоже считаются в UTC,
-  поэтому `window_time` — это UTC. Если нужен локальный пояс — сместите в
-  `AvgTempMedianHumidity.process`.
-- **Задержка результата.** Окна закрываются по watermark'у
-  (`event_time - 5s`), поэтому первая агрегата появляется примерно через минуту
-  после старта генератора.
-- **Сместить начало чтения.** В `kafka_source_ddl()` стоит `earliest-offset`
-  (читаем с начала, удобно для демо). Для боевого сценария поменяйте на `latest-offset`.
-- **Изменили `flink_job.py`?** Пересоберите образ и пересабмитьте: `make resubmit`.
-- **Параллелизм.** Сейчас `parallelism.default = 1`. Для нагрузки увеличьте число
-  партиций топика и параллелизм.
-
-## Траблшутинг
-
-- `make logs` — общие логи; `docker compose logs job-submitter` — что с сабмитом.
-- Джоба не видна в UI: проверьте, что `job-submitter` завершился успешно и что
-  `kafka-init` создал топики (`docker compose logs kafka-init`).
-- Нет результата в `iot-aggregates`: подождите минуту (event-time окно); убедитесь,
-  что `generator` шлёт события (`make events`).
-- Падает сборка образа Flink на скачивании jar'ов: проверьте доступ в интернет/прокси —
-  координаты Maven Central указаны в `flink/Dockerfile` (ARG'и сверху).
