@@ -1,0 +1,175 @@
+# ============================================================================
+#  Заключительный проект Flink — полный стек, запускается одной командой:
+#      docker compose up --build
+#
+#  Сервисы:
+#    kafka         — брокер Kafka (KRaft, без ZooKeeper)
+#    kafka-init    — создаёт топики iot-events / iot-aggregates и завершается
+#    postgres      — справочник device_types (ddl.sql + dml.sql при init)
+#    jobmanager    — Flink JobManager (+ web UI на http://localhost:8081)
+#    taskmanager   — Flink TaskManager
+#    generator     — генератор IoT-сообщений (раз в секунду -> kafka)
+#    job-submitter — сабмитит PyFlink-джобу в кластер и завершается
+#    kafka-ui      — веб-просмотр топиков на http://localhost:8080 (опционально)
+# ============================================================================
+
+name: flink-iot
+
+services:
+  # ------------------------------------------------------------------ Kafka --
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    ports:
+      - "29092:29092"          # доступ с хоста (localhost:29092)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # NB: use empty host (://:port), not 0.0.0.0. In KRaft combined mode the controller's
+      # advertised address is derived from this listener; literal 0.0.0.0 makes Kafka 3.9 reject
+      # storage format ("advertised.listeners cannot use 0.0.0.0"). Empty host -> routable addr.
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 1
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  # ------------------------------------------------------- Создание топиков --
+  kafka-init:
+    image: apache/kafka:3.9.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic iot-events     --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic iot-aggregates --partitions 1 --replication-factor 1
+        echo "Топики созданы:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  # --------------------------------------------------------------- Postgres --
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: iot
+      POSTGRES_PASSWORD: iot
+      POSTGRES_DB: iot
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/ddl.sql:/docker-entrypoint-initdb.d/01-ddl.sql:ro
+      - ./postgres/dml.sql:/docker-entrypoint-initdb.d/02-dml.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iot -d iot"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # ------------------------------------------------------- Flink JobManager --
+  jobmanager:
+    build: ./flink
+    image: flink-iot:1.20.1
+    container_name: jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"            # Flink Web UI
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ------------------------------------------------------ Flink TaskManager --
+  taskmanager:
+    image: flink-iot:1.20.1
+    container_name: taskmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+    depends_on:
+      jobmanager:
+        condition: service_started
+    restart: unless-stopped
+
+  # ----------------------------------------------------------- Генератор IoT -
+  generator:
+    build: ./generator
+    image: flink-iot-generator:latest
+    container_name: generator
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: iot-events
+      GEN_INTERVAL_SECONDS: "1.0"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ---------------------------------------------- Сабмит PyFlink-джобы -------
+  job-submitter:
+    image: flink-iot:1.20.1
+    container_name: job-submitter
+    depends_on:
+      jobmanager:
+        condition: service_started
+      taskmanager:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Жду JobManager REST..."
+        until curl -sf http://jobmanager:8081/overview >/dev/null 2>&1; do sleep 3; done
+        echo "Сабмичу PyFlink-джобу..."
+        flink run -d -m jobmanager:8081 -py /opt/flink/usrlib/job/flink_job.py
+        echo "Джоба отправлена. Смотри Flink UI: http://localhost:8081"
+    restart: "no"
+
+  # --------------------------------------------------- Kafka UI (опционально) -
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
